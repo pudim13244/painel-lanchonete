@@ -215,16 +215,21 @@ router.post('/', authenticateToken, requireRole(['ESTABLISHMENT']), async (req, 
     }
 
     let finalCustomerId = customer_id;
+    let finalDeliveryAddress = delivery_address;
 
     // Se não foi fornecido customer_id, buscar ou criar usuário
     if (!finalCustomerId) {
       const [existingUsers] = await pool.execute(
-        'SELECT id FROM users WHERE phone = ? AND role = "CUSTOMER"',
+        'SELECT id, address FROM users WHERE phone = ? AND role = "CUSTOMER"',
         [customer_phone]
       );
 
       if (existingUsers.length > 0) {
         finalCustomerId = existingUsers[0].id;
+        // Se não foi enviado delivery_address, usa o endereço cadastrado do usuário
+        if (!finalDeliveryAddress && existingUsers[0].address) {
+          finalDeliveryAddress = existingUsers[0].address;
+        }
       } else {
         // Criar novo usuário
         const [result] = await pool.execute(
@@ -238,6 +243,15 @@ router.post('/', authenticateToken, requireRole(['ESTABLISHMENT']), async (req, 
           ]
         );
         finalCustomerId = result.insertId;
+      }
+    } else if (!finalDeliveryAddress) {
+      // Se já tem customer_id mas não veio delivery_address, busca o endereço do usuário
+      const [userRows] = await pool.execute(
+        'SELECT address FROM users WHERE id = ?',
+        [finalCustomerId]
+      );
+      if (userRows.length > 0 && userRows[0].address) {
+        finalDeliveryAddress = userRows[0].address;
       }
     }
 
@@ -274,12 +288,114 @@ router.post('/', authenticateToken, requireRole(['ESTABLISHMENT']), async (req, 
         payment_method,
         order_type,
         amount_paid || null,
-        delivery_address || null,
+        finalDeliveryAddress || null,
         notes || null
       ]
     );
 
     const orderId = orderResult.insertId;
+
+    // Inserir na tabela order_offers sem entregador
+    await pool.execute(
+      'INSERT INTO order_offers (order_id, deliveryman_id, status) VALUES (?, NULL, ?)',
+      [orderId, 'pending']
+    );
+
+    // Buscar dados do pedido, cliente e estabelecimento para o histórico
+    const [orderRows] = await pool.execute(`
+      SELECT o.*, e.name as establishment_name, c.name as customer_name, c.phone as customer_phone
+      FROM orders o
+      JOIN users e ON o.establishment_id = e.id
+      LEFT JOIN users c ON o.customer_id = c.id
+      WHERE o.id = ?
+    `, [orderId]);
+    const order = orderRows[0] || {};
+
+    // Buscar itens do pedido
+    const [itemsRows] = await pool.execute(`
+      SELECT oi.quantity, p.name as product_name, oi.price, oi.obs
+      FROM order_items oi
+      JOIN products p ON oi.product_id = p.id
+      WHERE oi.order_id = ?
+    `, [orderId]);
+    const itemsText = itemsRows.map(item =>
+      `${item.quantity}x ${item.product_name} (R$ ${item.price})${item.obs ? ' - Obs: ' + item.obs : ''}`
+    ).join('\n');
+
+    // LOG dos dados que serão inseridos no histórico
+    console.log('Dados para delivery_history:', {
+      establishment_id: order.establishment_id,
+      establishment_name: order.establishment_name,
+      order_id: order.id,
+      customer_name: order.customer_name,
+      customer_phone: order.customer_phone,
+      delivery_address: order.delivery_address,
+      itemsText,
+      total_amount: order.total_amount,
+      delivery_fee: order.delivery_fee,
+      finished_at: order.created_at,
+      payment_method: order.payment_method,
+      order_notes: order.notes
+    });
+
+    // Garantir valores padrão para campos obrigatórios
+    const establishmentId = order.establishment_id || 0;
+    const establishmentName = order.establishment_name || '';
+    const orderIdHist = order.id || orderId;
+    const customerName = order.customer_name || '';
+    const customerPhone = order.customer_phone || '';
+    const deliveryAddress = order.delivery_address || '';
+    const totalAmountHist = order.total_amount || 0;
+    const deliveryFeeHist = order.delivery_fee || 0;
+    const createdAt = order.created_at || new Date();
+    const finishedAt = order.updated_at || null;
+    const paymentMethod = order.payment_method || '';
+    const orderNotes = order.notes || '';
+    // delivery_id e delivery_name podem ser null na criação
+    const deliveryId = order.delivery_id || null;
+    const deliveryName = order.delivery_name || null;
+
+    // LOG DETALHADO DOS VALORES
+    console.log('Valores para INSERT delivery_history:', [
+      establishmentId,
+      establishmentName,
+      deliveryId,
+      deliveryName,
+      orderIdHist,
+      customerName,
+      customerPhone,
+      deliveryAddress,
+      itemsText,
+      totalAmountHist,
+      deliveryFeeHist,
+      createdAt,
+      finishedAt,
+      paymentMethod,
+      orderNotes
+    ]);
+
+    await pool.execute(`
+      INSERT INTO delivery_history (
+        establishment_id, establishment_name, delivery_id, delivery_name, order_id,
+        customer_name, customer_phone, delivery_address, items, total_amount, delivery_fee, created_at, finished_at, payment_method, order_notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      establishmentId,
+      establishmentName,
+      deliveryId,
+      deliveryName,
+      orderIdHist,
+      customerName,
+      customerPhone,
+      deliveryAddress,
+      itemsText,
+      totalAmountHist,
+      deliveryFeeHist,
+      createdAt,
+      finishedAt,
+      paymentMethod,
+      orderNotes
+    ]);
 
     // Inserir itens do pedido
     for (const item of items) {
@@ -557,79 +673,56 @@ router.post('/', authenticateToken, requireRole(['CUSTOMER', 'ESTABLISHMENT']), 
   }
 });
 
-// PUT /api/orders/:id/status - Atualizar status do pedido
-router.put('/:id/status', authenticateToken, requireRole(['ESTABLISHMENT', 'DELIVERY']), async (req, res) => {
-  try {
-    const orderId = parseInt(req.params.id);
-    const { status } = req.body;
-    const userId = req.user.id;
-    const role = req.user.role;
-    
-    if (isNaN(orderId)) {
-      return res.status(400).json({
-        message: 'ID de pedido inválido'
-      });
-    }
-    
-    const validStatuses = ['PENDING', 'PREPARING', 'READY', 'DELIVERING', 'DELIVERED', 'CANCELLED'];
-    
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        message: 'Status inválido'
-      });
-    }
-    
-    // Verificar se o usuário tem acesso ao pedido
-    let accessQuery = 'SELECT * FROM orders WHERE id = ?';
-    let accessParams = [orderId];
-    
-    switch (role) {
-      case 'ESTABLISHMENT':
-        accessQuery += ' AND establishment_id = ?';
-        accessParams.push(userId);
-        break;
-      case 'DELIVERY':
-        accessQuery += ' AND delivery_id = ?';
-        accessParams.push(userId);
-        break;
-    }
-    
-    const order = await executeQuery(accessQuery, accessParams);
-    
-    if (order.length === 0) {
-      return res.status(404).json({
-        message: 'Pedido não encontrado ou sem permissão'
-      });
-    }
-    
-    // Atualizar status
-    await executeQuery(
-      'UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?',
-      [status, orderId]
-    );
-    
-    // Se for entregador aceitando entrega
-    if (role === 'DELIVERY' && status === 'DELIVERING' && !order[0].delivery_id) {
-      await executeQuery(
-        'UPDATE orders SET delivery_id = ? WHERE id = ?',
-        [userId, orderId]
-      );
-    }
-    
-    // Broadcast da atualização do pedido
-    broadcastOrderUpdate(order[0]);
-    
-    res.json({
-      message: 'Status do pedido atualizado com sucesso',
-      status
-    });
-  } catch (error) {
-    console.error('Erro ao atualizar status do pedido:', error);
-    res.status(500).json({
-      message: 'Erro interno do servidor'
-    });
-  }
-});
+// Função para salvar histórico de entrega
+async function saveDeliveryHistory(orderId) {
+  // Buscar todos os dados do pedido, entregador, cliente, itens
+  const [orderRows] = await pool.execute(`
+    SELECT o.*, e.name as establishment_name, d.name as delivery_name, c.name as customer_name, c.phone as customer_phone
+    FROM orders o
+    JOIN users e ON o.establishment_id = e.id
+    LEFT JOIN users d ON o.delivery_id = d.id
+    LEFT JOIN users c ON o.customer_id = c.id
+    WHERE o.id = ?
+  `, [orderId]);
+  if (!orderRows || orderRows.length === 0) return;
+  const order = orderRows[0];
+
+  // Buscar itens do pedido
+  const [itemsRows] = await pool.execute(`
+    SELECT oi.quantity, p.name as product_name, oi.price, oi.obs
+    FROM order_items oi
+    JOIN products p ON oi.product_id = p.id
+    WHERE oi.order_id = ?
+  `, [orderId]);
+  // Formatar itens como texto
+  const itemsText = itemsRows.map(item =>
+    `${item.quantity}x ${item.product_name} (R$ ${item.price})${item.obs ? ' - Obs: ' + item.obs : ''}`
+  ).join('\n');
+
+  // Salvar no histórico
+  await pool.execute(`
+    INSERT INTO delivery_history (
+      establishment_id, establishment_name, delivery_id, delivery_name, order_id,
+      customer_name, customer_phone, delivery_address, items, total_amount, delivery_fee, created_at, finished_at, payment_method, order_notes
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    order.establishment_id,
+    order.establishment_name,
+    order.delivery_id,
+    order.delivery_name,
+    order.id,
+    order.customer_name,
+    order.customer_phone,
+    order.delivery_address,
+    itemsText,
+    order.total_amount,
+    order.delivery_fee,
+    order.created_at || new Date(),
+    order.updated_at || null,
+    order.payment_method,
+    order.notes
+  ]);
+}
 
 // PUT /api/orders/:id - Atualizar pedido
 router.put('/:id', authenticateToken, requireRole('CUSTOMER'), async (req, res) => {
@@ -711,6 +804,231 @@ router.delete('/:id', authenticateToken, requireRole('CUSTOMER'), async (req, re
     res.status(500).json({
       message: 'Erro interno do servidor'
     });
+  }
+});
+
+// GET /api/orders/offers - Listar ofertas de pedidos
+router.get('/offers', authenticateToken, requireRole(['ESTABLISHMENT', 'DELIVERY']), async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    
+    let query = `
+      SELECT 
+        oo.id,
+        oo.order_id,
+        oo.deliveryman_id,
+        oo.status as offer_status,
+        oo.created_at as offer_created_at,
+        oo.updated_at as offer_updated_at,
+        o.id as order_id,
+        o.status as order_status,
+        o.total_amount,
+        o.delivery_fee,
+        o.payment_method,
+        o.order_type,
+        o.delivery_address,
+        o.notes,
+        o.created_at as order_created_at,
+        c.name as customer_name,
+        c.phone as customer_phone,
+        e.name as establishment_name,
+        d.name as delivery_name,
+        d.phone as delivery_phone
+      FROM order_offers oo
+      JOIN orders o ON oo.order_id = o.id
+      JOIN users c ON o.customer_id = c.id
+      JOIN users e ON o.establishment_id = e.id
+      LEFT JOIN users d ON oo.deliveryman_id = d.id
+      WHERE 1=1
+    `;
+    
+    let params = [];
+    
+    // Filtrar por papel do usuário
+    if (role === 'ESTABLISHMENT') {
+      query += ' AND o.establishment_id = ?';
+      params.push(userId);
+    } else if (role === 'DELIVERY') {
+      query += ' AND oo.deliveryman_id = ?';
+      params.push(userId);
+    }
+    
+    // Filtrar por status se fornecido
+    if (req.query.status) {
+      query += ' AND oo.status = ?';
+      params.push(req.query.status);
+    }
+    
+    // Filtrar por status do pedido se fornecido
+    if (req.query.order_status) {
+      query += ' AND o.status = ?';
+      params.push(req.query.order_status);
+    }
+    
+    // Ordenar por data de criação da oferta (mais recentes primeiro)
+    query += ' ORDER BY oo.created_at DESC';
+    
+    const offers = await executeQuery(query, params);
+    
+    res.json({
+      success: true,
+      offers: offers.map(offer => ({
+        id: offer.id,
+        order_id: offer.order_id,
+        deliveryman_id: offer.deliveryman_id,
+        offer_status: offer.offer_status,
+        offer_created_at: offer.offer_created_at,
+        offer_updated_at: offer.offer_updated_at,
+        order: {
+          id: offer.order_id,
+          status: offer.order_status,
+          total_amount: Number(offer.total_amount),
+          delivery_fee: Number(offer.delivery_fee),
+          payment_method: offer.payment_method,
+          order_type: offer.order_type,
+          delivery_address: offer.delivery_address,
+          notes: offer.notes,
+          created_at: offer.order_created_at,
+          customer_name: offer.customer_name,
+          customer_phone: offer.customer_phone,
+          establishment_name: offer.establishment_name,
+          delivery_name: offer.delivery_name,
+          delivery_phone: offer.delivery_phone
+        }
+      }))
+    });
+  } catch (error) {
+    console.error('Erro ao listar ofertas de pedidos:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erro interno do servidor'
+    });
+  }
+});
+
+// GET /api/orders/:orderId/offers - Listar ofertas de um pedido específico
+router.get('/:orderId/offers', authenticateToken, requireRole(['ESTABLISHMENT']), async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.orderId);
+    const userId = req.user.id;
+    
+    if (isNaN(orderId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID de pedido inválido'
+      });
+    }
+    
+    // Verificar se o pedido pertence ao estabelecimento
+    const order = await executeQuery(
+      'SELECT * FROM orders WHERE id = ? AND establishment_id = ?',
+      [orderId, userId]
+    );
+    
+    if (order.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pedido não encontrado'
+      });
+    }
+    
+    // Buscar ofertas do pedido
+    const offers = await executeQuery(`
+      SELECT 
+        oo.id,
+        oo.deliveryman_id,
+        oo.status as offer_status,
+        oo.created_at as offer_created_at,
+        oo.updated_at as offer_updated_at,
+        d.name as delivery_name,
+        d.phone as delivery_phone,
+        dp.vehicle_type,
+        dp.vehicle_model,
+        dp.plate
+      FROM order_offers oo
+      LEFT JOIN users d ON oo.deliveryman_id = d.id
+      LEFT JOIN delivery_profile dp ON d.id = dp.user_id
+      WHERE oo.order_id = ?
+      ORDER BY oo.created_at DESC
+    `, [orderId]);
+    
+    res.json({
+      success: true,
+      order_id: orderId,
+      offers: offers.map(offer => ({
+        id: offer.id,
+        deliveryman_id: offer.deliveryman_id,
+        offer_status: offer.offer_status,
+        offer_created_at: offer.offer_created_at,
+        offer_updated_at: offer.offer_updated_at,
+        delivery_name: offer.delivery_name,
+        delivery_phone: offer.delivery_phone,
+        vehicle_type: offer.vehicle_type,
+        vehicle_model: offer.vehicle_model,
+        plate: offer.plate
+      }))
+    });
+  } catch (error) {
+    console.error('Erro ao listar ofertas do pedido:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erro interno do servidor'
+    });
+  }
+});
+
+// ROTA 1: Listar entregadores do histórico de um estabelecimento
+router.get('/establishments/:establishmentId/delivery-history/deliverers', authenticateToken, requireRole(['ESTABLISHMENT', 'ADMIN']), async (req, res) => {
+  try {
+    const establishmentId = parseInt(req.params.establishmentId);
+    if (isNaN(establishmentId)) {
+      return res.status(400).json({ success: false, message: 'ID do estabelecimento inválido' });
+    }
+    // Buscar entregadores distintos do histórico, ordenados pelo mais recente
+    const [rows] = await pool.execute(`
+      SELECT DISTINCT delivery_id, delivery_name
+      FROM delivery_history
+      WHERE establishment_id = ?
+      ORDER BY MAX(finished_at) DESC
+    `, [establishmentId]);
+    res.json({
+      success: true,
+      deliverers: rows.map(r => ({ id: r.delivery_id, name: r.delivery_name }))
+    });
+  } catch (error) {
+    console.error('Erro ao listar entregadores do histórico:', error);
+    res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+  }
+});
+
+// ROTA 2: Listar histórico de entregas de um entregador, com filtro de data
+router.get('/establishments/:establishmentId/delivery-history/:deliveryId', authenticateToken, requireRole(['ESTABLISHMENT', 'ADMIN']), async (req, res) => {
+  try {
+    const establishmentId = parseInt(req.params.establishmentId);
+    const deliveryId = parseInt(req.params.deliveryId);
+    const date = req.query.date; // YYYY-MM-DD
+    if (isNaN(establishmentId) || isNaN(deliveryId)) {
+      return res.status(400).json({ success: false, message: 'ID inválido' });
+    }
+    let query = `SELECT * FROM delivery_history WHERE establishment_id = ? AND delivery_id = ?`;
+    let params = [establishmentId, deliveryId];
+    if (date) {
+      query += ' AND DATE(finished_at) = ?';
+      params.push(date);
+    }
+    query += ' ORDER BY finished_at DESC';
+    const [rows] = await pool.execute(query, params);
+    // Calcular total das taxas de entrega do dia
+    const totalTaxas = rows.reduce((acc, r) => acc + (r.delivery_fee || 0), 0);
+    res.json({
+      success: true,
+      total_delivery_fee: totalTaxas,
+      deliveries: rows
+    });
+  } catch (error) {
+    console.error('Erro ao listar histórico de entregas:', error);
+    res.status(500).json({ success: false, message: 'Erro interno do servidor' });
   }
 });
 

@@ -1,14 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
-const auth = require('../middleware/auth');
+const { authenticateToken } = require('../middleware/auth');
 
 // Buscar endereços de um usuário por telefone
 router.get('/by-phone/:phone', async (req, res) => {
     try {
         const { phone } = req.params;
-        
-        // Primeiro, encontrar o usuário pelo telefone
+        // Buscar qualquer usuário com o telefone informado, independente do tipo
         const [users] = await db.query(
             'SELECT id, name, phone FROM users WHERE phone = ?',
             [phone]
@@ -32,6 +31,7 @@ router.get('/by-phone/:phone', async (req, res) => {
         }
 
         const user = users[0];
+        console.log('Buscando endereços para userId:', user.id, 'nome:', user.name, 'telefone:', user.phone);
 
         // Buscar endereços do usuário
         const [addresses] = await db.query(
@@ -62,7 +62,7 @@ router.get('/by-phone/:phone', async (req, res) => {
 });
 
 // Listar endereços de um usuário
-router.get('/user/:userId', auth, async (req, res) => {
+router.get('/user/:userId', authenticateToken, async (req, res) => {
     try {
         const { userId } = req.params;
         
@@ -97,10 +97,17 @@ router.get('/user/:userId', auth, async (req, res) => {
 });
 
 // Adicionar novo endereço
-router.post('/', auth, async (req, res) => {
+router.post('/', authenticateToken, async (req, res) => {
     try {
-        const { label, address, is_default = false } = req.body;
-        const userId = req.user.id;
+        const { label, address, is_default = false, user_id } = req.body;
+        if (!user_id) {
+          return res.status(400).json({
+            success: false,
+            message: 'user_id do cliente é obrigatório ao adicionar endereço.'
+          });
+        }
+        const userId = user_id;
+        console.log('Salvando endereço para userId:', userId, 'label:', label, 'address:', address);
 
         if (!label || !address) {
             return res.status(400).json({
@@ -143,7 +150,7 @@ router.post('/', auth, async (req, res) => {
 });
 
 // Atualizar endereço
-router.put('/:addressId', auth, async (req, res) => {
+router.put('/:addressId', authenticateToken, async (req, res) => {
     try {
         const { addressId } = req.params;
         const { label, address, is_default = false } = req.body;
@@ -211,7 +218,7 @@ router.put('/:addressId', auth, async (req, res) => {
 });
 
 // Excluir endereço
-router.delete('/:addressId', auth, async (req, res) => {
+router.delete('/:addressId', authenticateToken, async (req, res) => {
     try {
         const { addressId } = req.params;
         const userId = req.user.id;
@@ -268,7 +275,7 @@ router.delete('/:addressId', auth, async (req, res) => {
 });
 
 // Definir endereço como padrão
-router.patch('/:addressId/set-default', auth, async (req, res) => {
+router.patch('/:addressId/set-default', authenticateToken, async (req, res) => {
     try {
         const { addressId } = req.params;
         const userId = req.user.id;

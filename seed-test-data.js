@@ -181,6 +181,27 @@ const seedTestData = async () => {
       }
     }
 
+    // SQL para criar a tabela de histórico de entregas
+    /*
+    CREATE TABLE delivery_history (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      establishment_id INT NOT NULL,
+      establishment_name VARCHAR(255) NOT NULL,
+      delivery_id INT NOT NULL,
+      delivery_name VARCHAR(255) NOT NULL,
+      order_id INT,
+      customer_name VARCHAR(255),
+      customer_phone VARCHAR(30),
+      delivery_address TEXT,
+      items TEXT,
+      total_amount DECIMAL(10,2),
+      delivery_fee DECIMAL(10,2),
+      finished_at DATETIME,
+      payment_method VARCHAR(20),
+      order_notes TEXT
+    );
+    */
+
     console.log('🎉 População de dados de teste concluída!');
     console.log('\n📊 Resumo dos dados criados:');
     console.log(`- ${createdCategories.length} categorias`);

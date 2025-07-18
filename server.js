@@ -20,6 +20,7 @@ const establishmentsRoutes = require('./routes/establishments');
 const acrescimosRouter = require('./routes/acrescimos');
 const optionGroupsRouter = require('./routes/option-groups');
 const optionsRouter = require('./routes/options');
+const userAddressesRoutes = require('./routes/user-addresses');
 
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
@@ -76,6 +77,7 @@ app.use('/api/establishments', express.json({ limit: '10mb' }), express.urlencod
 app.use('/api/acrescimos', express.json({ limit: '10mb' }), express.urlencoded({ extended: true }), acrescimosRouter);
 app.use('/api/option-groups', express.json({ limit: '10mb' }), express.urlencoded({ extended: true }), optionGroupsRouter);
 app.use('/api/options', express.json({ limit: '10mb' }), express.urlencoded({ extended: true }), optionsRouter);
+app.use('/api/user-addresses', express.json({ limit: '10mb' }), express.urlencoded({ extended: true }), userAddressesRoutes);
 
 // Rota de estabelecimento (inclui upload de arquivos) - sem express.json() global
 app.use('/api/establishment', establishmentRoutes);
@@ -178,6 +180,6 @@ module.exports = { app, server, broadcastNewOrder, broadcastOrderUpdate };
 
 server.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`📡 API disponível em: http://localhost:${PORT}/api`);
+  console.log(`�� API disponível em: http://localhost:${PORT}/api`);
   console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
 }); 

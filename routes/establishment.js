@@ -994,7 +994,148 @@ router.get('/cuisine-types', verifyToken, isEstablishment, async (req, res) => {
   }
 });
 
-// Endpoint para listar entregadores vinculados ao estabelecimento
+// Vincular entregador ao estabelecimento
+router.post('/delivery-people/link', jsonParser, urlencodedParser, verifyToken, isEstablishment, async (req, res) => {
+  try {
+    const establishmentId = req.user.id;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'E-mail do entregador é obrigatório' });
+    }
+
+    // Buscar entregador pelo e-mail
+    const [deliveryUsers] = await pool.execute(
+      'SELECT id, name, email, role FROM users WHERE email = ? AND role = "DELIVERY"',
+      [email]
+    );
+
+    if (deliveryUsers.length === 0) {
+      return res.status(404).json({ message: 'Entregador não encontrado ou não possui perfil de entregador' });
+    }
+
+    const deliveryUser = deliveryUsers[0];
+
+    // Verificar se já está vinculado
+    const [existingLink] = await pool.execute(
+      'SELECT id FROM establishment_delivery WHERE establishment_id = ? AND delivery_id = ?',
+      [establishmentId, deliveryUser.id]
+    );
+
+    if (existingLink.length > 0) {
+      return res.status(400).json({ message: 'Entregador já está vinculado a este estabelecimento' });
+    }
+
+    // Vincular entregador
+    await pool.execute(
+      'INSERT INTO establishment_delivery (establishment_id, delivery_id, is_default, apply_fee) VALUES (?, ?, 0, 1)',
+      [establishmentId, deliveryUser.id]
+    );
+
+    res.json({ 
+      message: 'Entregador vinculado com sucesso',
+      delivery_id: deliveryUser.id,
+      delivery_name: deliveryUser.name
+    });
+
+  } catch (error) {
+    console.error('Erro ao vincular entregador:', error);
+    res.status(500).json({ message: 'Erro ao vincular entregador', error: error.message });
+  }
+});
+
+// Desvincular entregador do estabelecimento
+router.delete('/delivery-people/:deliveryId', verifyToken, isEstablishment, async (req, res) => {
+  try {
+    const establishmentId = req.user.id;
+    const deliveryId = req.params.deliveryId;
+
+    console.log('Tentando desvincular entregador:', { establishmentId, deliveryId });
+
+    // Verificar se existe o vínculo
+    const [existingLink] = await pool.execute(
+      'SELECT id FROM establishment_delivery WHERE establishment_id = ? AND delivery_id = ?',
+      [establishmentId, deliveryId]
+    );
+
+    console.log('Vínculo encontrado:', existingLink.length > 0);
+
+    if (existingLink.length === 0) {
+      return res.status(404).json({ message: 'Vínculo não encontrado' });
+    }
+
+    // Verificar se o entregador tem pedidos ativos
+    const [activeOrders] = await pool.execute(
+      'SELECT COUNT(*) as count FROM orders WHERE delivery_id = ? AND status IN ("READY", "DELIVERING") AND establishment_id = ?',
+      [deliveryId, establishmentId]
+    );
+
+    console.log('Pedidos ativos encontrados:', activeOrders[0].count);
+
+    if (activeOrders[0].count > 0) {
+      return res.status(400).json({ 
+        message: 'Não é possível desvincular entregador com pedidos ativos',
+        activeOrders: activeOrders[0].count
+      });
+    }
+
+    // Remover vínculo
+    await pool.execute(
+      'DELETE FROM establishment_delivery WHERE establishment_id = ? AND delivery_id = ?',
+      [establishmentId, deliveryId]
+    );
+
+    console.log('Entregador desvinculado com sucesso');
+
+    res.json({ message: 'Entregador desvinculado com sucesso' });
+
+  } catch (error) {
+    console.error('Erro ao desvincular entregador:', error);
+    res.status(500).json({ message: 'Erro ao desvincular entregador', error: error.message });
+  }
+});
+
+// Definir entregador como prioritário (padrão)
+router.post('/delivery-people/set-priority', jsonParser, urlencodedParser, verifyToken, isEstablishment, async (req, res) => {
+  try {
+    const establishmentId = req.user.id;
+    const { delivery_id } = req.body;
+
+    if (!delivery_id) {
+      return res.status(400).json({ message: 'ID do entregador é obrigatório' });
+    }
+
+    // Verificar se existe o vínculo
+    const [existingLink] = await pool.execute(
+      'SELECT id FROM establishment_delivery WHERE establishment_id = ? AND delivery_id = ?',
+      [establishmentId, delivery_id]
+    );
+
+    if (existingLink.length === 0) {
+      return res.status(404).json({ message: 'Vínculo não encontrado' });
+    }
+
+    // Remover prioridade de todos os entregadores do estabelecimento
+    await pool.execute(
+      'UPDATE establishment_delivery SET is_default = 0 WHERE establishment_id = ?',
+      [establishmentId]
+    );
+
+    // Definir este entregador como prioritário
+    await pool.execute(
+      'UPDATE establishment_delivery SET is_default = 1 WHERE establishment_id = ? AND delivery_id = ?',
+      [establishmentId, delivery_id]
+    );
+
+    res.json({ message: 'Entregador definido como prioritário' });
+
+  } catch (error) {
+    console.error('Erro ao definir entregador prioritário:', error);
+    res.status(500).json({ message: 'Erro ao definir entregador prioritário', error: error.message });
+  }
+});
+
+// Atualizar a rota de listagem para incluir mais informações
 router.get('/delivery-people', verifyToken, isEstablishment, async (req, res) => {
   try {
     const establishmentId = req.user.id;
@@ -1003,15 +1144,18 @@ router.get('/delivery-people', verifyToken, isEstablishment, async (req, res) =>
         u.id, 
         u.name, 
         u.email,
+        u.phone,
+        ed.is_default,
+        ed.apply_fee,
         COUNT(o.id) as active_orders,
         (COUNT(o.id) < 3) as is_available
       FROM users u
       INNER JOIN establishment_delivery ed ON u.id = ed.delivery_id
-      LEFT JOIN orders o ON u.id = o.delivery_id AND o.status IN ('READY', 'DELIVERING')
+      LEFT JOIN orders o ON u.id = o.delivery_id AND o.status IN ('READY', 'DELIVERING') AND o.establishment_id = ?
       WHERE ed.establishment_id = ?
-      GROUP BY u.id, u.name, u.email
-      ORDER BY u.name
-    `, [establishmentId]);
+      GROUP BY u.id, u.name, u.email, u.phone, ed.is_default, ed.apply_fee
+      ORDER BY ed.is_default DESC, u.name ASC
+    `, [establishmentId, establishmentId]);
     res.json({ delivery_people: rows });
   } catch (error) {
     console.error('Erro ao buscar entregadores:', error);
@@ -1058,7 +1202,11 @@ router.post('/orders/:orderId/assign-delivery-auto', jsonParser, urlencodedParse
         ORDER BY active_orders ASC, u.name ASC
       `, [establishmentId]);
       if (deliveryPeople.length === 0) {
-        return res.status(400).json({ message: 'Nenhum entregador vinculado disponível no momento' });
+        return res.status(400).json({ 
+          message: 'Nenhum entregador vinculado disponível. Vincule entregadores na página de entregadores vinculados.',
+          code: 'NO_LINKED_DELIVERY',
+          suggestion: 'Vincule entregadores ao seu estabelecimento para atribuição automática.'
+        });
       }
       selectedDelivery = deliveryPeople[0];
     } else {
@@ -1104,6 +1252,34 @@ router.post('/orders/:orderId/assign-delivery-auto', jsonParser, urlencodedParse
       message: 'Erro ao atribuir entregador automaticamente',
       error: error.message 
     });
+  }
+});
+
+// Remover entregador de um pedido
+router.delete('/orders/:orderId/remove-delivery', verifyToken, isEstablishment, async (req, res) => {
+  try {
+    const establishmentId = req.user.id;
+    const orderId = req.params.orderId;
+
+    // Verifica se o pedido pertence ao estabelecimento
+    const [orders] = await pool.execute(
+      'SELECT * FROM orders WHERE id = ? AND establishment_id = ?',
+      [orderId, establishmentId]
+    );
+    if (orders.length === 0) {
+      return res.status(404).json({ message: 'Pedido não encontrado' });
+    }
+
+    // Remove o entregador do pedido
+    await pool.execute(
+      'UPDATE orders SET delivery_id = NULL WHERE id = ?',
+      [orderId]
+    );
+
+    res.json({ message: 'Entregador removido do pedido com sucesso' });
+  } catch (error) {
+    console.error('Erro ao remover entregador do pedido:', error);
+    res.status(500).json({ message: 'Erro ao remover entregador do pedido', error: error.message });
   }
 });
 
